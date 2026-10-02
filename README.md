@@ -5,6 +5,8 @@
 
 # mc-mcp-server
 
+<img alt="image" src="src/test/resources/SS.png" width="480" /> &nbsp;&nbsp;claude opus5.5 build the castle
+
 ⛏️ Model Context Protocol server for Minecraft.
 
 ## Install
@@ -36,6 +38,12 @@ java -cp ... vavi.games.minecraft.mcp.MinecraftBotMCP [-host localhost] [-port 2
 | get-block-info, find-block | reads the bot's copy of the loaded chunks |
 | find-entity | the nearest entity by type or player name |
 | send-chat | chat, or a command when it starts with `/`; returns the server's response messages |
+| build-blocks | places a list of blocks in one call: equips items, orders placements so each block has support, walks within reach, builds temporary pillars for high positions, resumable |
+| fill-region | fills a box (solid, hollow or walls) the same way |
+| clear-region | digs a box from the top (optionally only matching blocks, e.g. logs), with the best tool in the inventory |
+| scan-area | height map of an area (optionally ignoring trees) for planning |
+
+the bot walks through leaves by digging them, and picks the best tool (axe, pickaxe, shovel, hoe) for digging.
 
 ### game data
 
