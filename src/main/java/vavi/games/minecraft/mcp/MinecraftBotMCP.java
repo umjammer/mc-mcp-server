@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -32,6 +33,7 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 import org.cloudburstmc.math.vector.Vector3d;
+import org.cloudburstmc.math.vector.Vector3i;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -84,6 +86,7 @@ public class MinecraftBotMCP {
         registerBlockTools(server, bot);
         registerEntityTools(server, bot);
         registerChatTools(server, bot);
+        registerBuildTools(server, bot);
 
         return server.build();
     }
@@ -400,6 +403,126 @@ public class MinecraftBotMCP {
                     return "Found " + block.name() + " at position ("
                             + block.position().getX() + ", " + block.position().getY() + ", " + block.position().getZ() + ")";
                 })
+        );
+    }
+
+    static final Map<String, ?> SCAFFOLD = Map.of("type", "string", "description", "Block for temporary pillars to reach high positions, removed afterwards (default: 'dirt')", "optional", true);
+    static final Map<String, ?> MAX_SECONDS = Map.of("type", "number", "description", "Time limit, call again to continue the rest (default: 300)", "optional", true);
+
+    static String summarize(MinecraftBot.BatchResult r, String verb) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(verb).append(" ").append(r.done()).append(" blocks, ").append(r.alreadyDone()).append(" were already done, ")
+                .append(r.remaining()).append(" remaining");
+        if (r.timedOut()) sb.append(" (time limit reached, call again to continue)");
+        if (!r.missingItems().isEmpty()) {
+            sb.append("\nMissing items: ").append(r.missingItems().entrySet().stream()
+                    .map(e -> e.getKey() + " x" + e.getValue()).collect(Collectors.joining(", ")));
+        }
+        if (!r.problems().isEmpty()) {
+            sb.append("\nProblems:\n- ").append(String.join("\n- ", r.problems().subList(0, Math.min(20, r.problems().size()))));
+            if (r.problems().size() > 20) sb.append("\n- ... and ").append(r.problems().size() - 20).append(" more");
+        }
+        return sb.toString();
+    }
+
+    /** Building Tools */
+    static void registerBuildTools(McpServer.AsyncSpecification<?> server, MinecraftBot bot) {
+        server.toolCall(tool(
+                        "build-blocks",
+                        "Place many blocks in one call. The bot equips items, orders the placements so every block has a neighbor " +
+                                "to place against, walks within reach and builds temporary pillars for high positions. " +
+                                "Blocks already in place are skipped, so the same list can be sent again to resume.", createSchema(Map.of(
+                        "blocks", Map.of("type", "array", "description", "Blocks to place",
+                                "items", Map.of("type", "object",
+                                        "properties", Map.of("x", X, "y", Y, "z", Z, "block", Map.of("type", "string", "description", "Item name, e.g. stone_bricks")),
+                                        "required", List.of("x", "y", "z", "block"))),
+                        "scaffoldBlock", SCAFFOLD,
+                        "maxSeconds", MAX_SECONDS
+                ))),
+                handler(args -> () -> {
+                    @SuppressWarnings("unchecked")
+                    List<Map<String, Object>> blocks = (List<Map<String, Object>>) args.get("blocks");
+                    if (blocks == null) throw new IllegalArgumentException("'blocks' is required");
+                    List<MinecraftBot.Placement> placements = blocks.stream()
+                            .map(b -> new MinecraftBot.Placement(Vector3i.from(intArg(b, "x"), intArg(b, "y"), intArg(b, "z")), stringArg(b, "block", "")))
+                            .toList();
+
+                    var result = bot.buildBlocks(placements, stringArg(args, "scaffoldBlock", "dirt"), intArg(args, "maxSeconds", 300) * 1000L);
+
+                    return summarize(result, "Placed");
+                })
+        );
+
+        server.toolCall(tool(
+                        "fill-region",
+                        "Fill a box (both corners inclusive) with a block by placing them one by one like build-blocks", createSchema(Map.of(
+                        "x1", X, "y1", Y, "z1", Z,
+                        "x2", X, "y2", Y, "z2", Z,
+                        "block", Map.of("type", "string", "description", "Item name, e.g. stone_bricks"),
+                        "mode", Map.of("type", "string", "description", "solid: whole box, hollow: outer shell, walls: four sides without floor and ceiling (default: solid)",
+                                "enum", List.of("solid", "hollow", "walls"), "optional", true),
+                        "scaffoldBlock", SCAFFOLD,
+                        "maxSeconds", MAX_SECONDS
+                ))),
+                handler(args -> () -> {
+                    Vector3i a = Vector3i.from(intArg(args, "x1"), intArg(args, "y1"), intArg(args, "z1"));
+                    Vector3i b = Vector3i.from(intArg(args, "x2"), intArg(args, "y2"), intArg(args, "z2"));
+                    Vector3i min = a.min(b), max = a.max(b);
+                    String block = stringArg(args, "block", "");
+                    String mode = stringArg(args, "mode", "solid");
+                    List<MinecraftBot.Placement> placements = new ArrayList<>();
+                    for (int y = min.getY(); y <= max.getY(); y++) {
+                        for (int x = min.getX(); x <= max.getX(); x++) {
+                            for (int z = min.getZ(); z <= max.getZ(); z++) {
+                                boolean side = x == min.getX() || x == max.getX() || z == min.getZ() || z == max.getZ();
+                                boolean include = switch (mode) {
+                                    case "solid" -> true;
+                                    case "hollow" -> side || y == min.getY() || y == max.getY();
+                                    case "walls" -> side;
+                                    default -> throw new IllegalArgumentException("Unknown mode: " + mode);
+                                };
+                                if (include) placements.add(new MinecraftBot.Placement(Vector3i.from(x, y, z), block));
+                            }
+                        }
+                    }
+
+                    var result = bot.buildBlocks(placements, stringArg(args, "scaffoldBlock", "dirt"), intArg(args, "maxSeconds", 300) * 1000L);
+
+                    return summarize(result, "Placed");
+                })
+        );
+
+        server.toolCall(tool(
+                        "clear-region",
+                        "Dig every block in a box (both corners inclusive) from the top, e.g. to cut trees or flatten ground", createSchema(Map.of(
+                        "x1", X, "y1", Y, "z1", Z,
+                        "x2", X, "y2", Y, "z2", Z,
+                        "only", Map.of("type", "array", "items", Map.of("type", "string"), "optional", true,
+                                "description", "Dig only blocks whose names contain one of these, e.g. [\"_log\"] to cut trees and let the leaves decay (default: all)"),
+                        "scaffoldBlock", SCAFFOLD,
+                        "maxSeconds", MAX_SECONDS
+                ))),
+                handler(args -> () -> {
+                    Vector3i a = Vector3i.from(intArg(args, "x1"), intArg(args, "y1"), intArg(args, "z1"));
+                    Vector3i b = Vector3i.from(intArg(args, "x2"), intArg(args, "y2"), intArg(args, "z2"));
+                    @SuppressWarnings("unchecked")
+                    List<String> only = args.get("only") instanceof List<?> l ? (List<String>) l : List.of();
+
+                    var result = bot.clearRegion(a, b, only, stringArg(args, "scaffoldBlock", "dirt"), intArg(args, "maxSeconds", 300) * 1000L);
+
+                    return summarize(result, "Dug");
+                })
+        );
+
+        server.toolCall(tool(
+                        "scan-area",
+                        "Get a height map of the top blocks in an area (at most 64x64) to plan building", createSchema(Map.of(
+                        "x1", X, "z1", Z,
+                        "x2", X, "z2", Z,
+                        "ground", Map.of("type", "boolean", "description", "Ignore trees to see the ground (default: false)", "optional", true)
+                ))),
+                handler(args -> () -> bot.scanArea(intArg(args, "x1"), intArg(args, "z1"), intArg(args, "x2"), intArg(args, "z2"),
+                        Boolean.parseBoolean(stringArg(args, "ground", "false"))))
         );
     }
 

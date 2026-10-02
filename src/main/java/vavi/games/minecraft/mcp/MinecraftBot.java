@@ -17,10 +17,13 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -30,6 +33,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
 import java.util.stream.Collectors;
 
 import net.kyori.adventure.text.Component;
@@ -543,7 +548,7 @@ class MinecraftBot {
         sendPosition();
         Thread.sleep(TICK_MS);
         if (teleports.get() != teleportsBefore) {
-            throw new IllegalStateException("Movement was corrected by the server, now at " + format(getPosition()));
+            throw new MovementCorrectedException("Movement was corrected by the server, now at " + format(getPosition()));
         }
     }
 
@@ -595,9 +600,33 @@ class MinecraftBot {
     private boolean canStand(int bx, int by, int bz) {
         if (!passable(bx, by, bz) || !passable(bx, by + 1, bz)) return false;
         int below = world.getBlock(bx, by - 1, bz);
-        if (below == World.UNKNOWN || GameData.isDangerous(below)) return false;
+        if (below == World.UNKNOWN || GameData.isDangerous(below) || breakable(bx, by - 1, bz)) return false; // not on tree tops
         float h = GameData.collisionHeight(below);
         return h > 0 && h <= 1;
+    }
+
+    /** extra path cost of digging a block out of the way */
+    private static final double DIG_COST = 3;
+
+    /** blocks the path finder may dig through */
+    private boolean breakable(int bx, int by, int bz) {
+        int state = world.getBlock(bx, by, bz);
+        return state != World.UNKNOWN && GameData.blockName(state).endsWith("_leaves");
+    }
+
+    /** @return extra cost to make the cell passable, -1 if impossible */
+    private double clearCost(int bx, int by, int bz) {
+        return passable(bx, by, bz) ? 0 : breakable(bx, by, bz) ? DIG_COST : -1;
+    }
+
+    /** @return extra cost of standing with feet at the block including digging leaves out of the way, -1 if impossible */
+    private double standCost(int bx, int by, int bz) {
+        double feet = clearCost(bx, by, bz), head = clearCost(bx, by + 1, bz);
+        if (feet < 0 || head < 0) return -1;
+        int below = world.getBlock(bx, by - 1, bz);
+        if (below == World.UNKNOWN || GameData.isDangerous(below) || breakable(bx, by - 1, bz)) return -1; // not on tree tops
+        float h = GameData.collisionHeight(below);
+        return h > 0 && h <= 1 ? feet + head : -1;
     }
 
     /** feet height when standing on block (bx, by, bz) */
@@ -609,30 +638,51 @@ class MinecraftBot {
         Vector3d center() { return Vector3d.from(x + 0.5, y, z + 0.5); }
     }
 
+    private Node currentNode() {
+        return new Node((int) Math.floor(x), (int) Math.floor(y + 0.5), (int) Math.floor(z));
+    }
+
     /**
      * A* over standable block positions: walk, diagonal walk, step up 1 block, drop up to 3 blocks.
      * @return path from the start (exclusive) to the reachable node nearest to the goal
      */
     private List<Node> findPath(Vector3d goal, double range, int maxNodes) {
-        Node start = new Node((int) Math.floor(x), (int) Math.floor(y + 0.5), (int) Math.floor(z));
+        return search(n -> n.center().distance(goal) <= range, n -> n.center().distance(goal), maxNodes, true);
+    }
+
+    /**
+     * A* over standable block positions.
+     * @param heuristic estimated cost to a goal, also used to pick the best node for a partial path
+     * @param partial when no goal is found, return the path to the node with the smallest heuristic instead of null
+     * @return path from the start (exclusive) to a goal node, empty when the start is a goal, null when not found
+     */
+    private List<Node> search(Predicate<Node> isGoal, ToDoubleFunction<Node> heuristic, int maxNodes, boolean partial) {
+        Node start = currentNode();
         Map<Node, Node> cameFrom = new HashMap<>();
         Map<Node, Double> cost = new HashMap<>();
         PriorityQueue<Map.Entry<Node, Double>> open = new PriorityQueue<>(Map.Entry.comparingByValue());
         Set<Node> closed = new HashSet<>();
         cost.put(start, 0.0);
-        open.add(Map.entry(start, start.center().distance(goal)));
+        open.add(Map.entry(start, heuristic.applyAsDouble(start)));
         Node best = start;
-        double bestDistance = start.center().distance(goal);
+        double bestDistance = heuristic.applyAsDouble(start);
+        boolean found = false;
+        // safe drop height: fall damage is (height - 3), keep at least 6 health
+        int maxDrop = Math.max(3, Math.min(12, 3 + (int) (health - 6)));
 
         while (!open.isEmpty() && closed.size() < maxNodes) {
             Node n = open.poll().getKey();
             if (!closed.add(n)) continue;
-            double distance = n.center().distance(goal);
+            double distance = heuristic.applyAsDouble(n);
             if (distance < bestDistance) {
                 best = n;
                 bestDistance = distance;
             }
-            if (distance <= range) break;
+            if (isGoal.test(n)) {
+                best = n;
+                found = true;
+                break;
+            }
 
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dz = -1; dz <= 1; dz++) {
@@ -643,14 +693,18 @@ class MinecraftBot {
                             passable(n.x, n.y, n.z + dz) && passable(n.x, n.y + 1, n.z + dz))) continue;
                     double base = diagonal ? Math.sqrt(2) : 1;
                     List<Map.Entry<Node, Double>> next = new ArrayList<>();
-                    if (canStand(nx, n.y, nz)) {
-                        next.add(Map.entry(new Node(nx, n.y, nz), base));
-                    } else if (!diagonal && canStand(nx, n.y + 1, nz) && passable(n.x, n.y + 2, n.z)) {
-                        next.add(Map.entry(new Node(nx, n.y + 1, nz), base + 1));
+                    double same = diagonal ? (canStand(nx, n.y, nz) ? 0 : -1) : standCost(nx, n.y, nz);
+                    double up = diagonal ? -1 : standCost(nx, n.y + 1, nz);
+                    double headRoom = clearCost(n.x, n.y + 2, n.z);
+                    if (same >= 0) {
+                        next.add(Map.entry(new Node(nx, n.y, nz), base + same));
+                    } else if (up >= 0 && headRoom >= 0) {
+                        next.add(Map.entry(new Node(nx, n.y + 1, nz), base + 1 + up + headRoom));
                     } else if (!diagonal && passable(nx, n.y, nz) && passable(nx, n.y + 1, nz)) {
-                        for (int d = 1; d <= 3; d++) {
+                        for (int d = 1; d <= maxDrop; d++) {
                             if (canStand(nx, n.y - d, nz)) {
-                                next.add(Map.entry(new Node(nx, n.y - d, nz), base + d * 0.5));
+                                // drops over 3 blocks hurt, take them only when there's no other way
+                                next.add(Map.entry(new Node(nx, n.y - d, nz), base + d * 0.5 + Math.max(0, d - 3) * 20));
                                 break;
                             }
                             if (!passable(nx, n.y - d, nz)) break;
@@ -662,22 +716,28 @@ class MinecraftBot {
                         if (!closed.contains(m) && c < cost.getOrDefault(m, Double.MAX_VALUE)) {
                             cost.put(m, c);
                             cameFrom.put(m, n);
-                            open.add(Map.entry(m, c + m.center().distance(goal)));
+                            open.add(Map.entry(m, c + heuristic.applyAsDouble(m)));
                         }
                     }
                 }
             }
         }
 
+        if (!found && !partial) return null;
         List<Node> path = new ArrayList<>();
         for (Node n = best; !n.equals(start); n = cameFrom.get(n)) path.add(0, n);
         return path;
     }
 
-    /** follows the path node by node with walking, jumping and falling */
-    private void followPath(List<Node> path) throws InterruptedException {
-        int teleportsBefore = teleports.get();
+    /** follows the path node by node with walking, jumping and falling, digs leaves in the way */
+    private void followPath(List<Node> path) throws Exception {
         for (Node n : path) {
+            List<Vector3i> obstacles = new ArrayList<>(List.of(Vector3i.from(n.x, n.y + 1, n.z), Vector3i.from(n.x, n.y, n.z)));
+            if (n.y > Math.floor(y + EPSILON)) obstacles.addFirst(Vector3i.from((int) Math.floor(x), (int) Math.floor(y + EPSILON) + 2, (int) Math.floor(z)));
+            for (Vector3i p : obstacles) {
+                if (breakable(p.getX(), p.getY(), p.getZ())) digAt(p, false);
+            }
+            int teleportsBefore = teleports.get();
             double ny = standY(n.x, n.y, n.z);
             if (ny > y + EPSILON) climb(ny, teleportsBefore);
             walkTo(n.x + 0.5, n.z + 0.5, teleportsBefore);
@@ -927,19 +987,83 @@ class MinecraftBot {
         return Vector3d.from(x, y + EYE_HEIGHT, z).distance(target);
     }
 
-    /** walks near the block if it's out of reach */
-    private void approach(int bx, int by, int bz) throws Exception {
-        if (eyeDistance(Vector3d.from(bx + 0.5, by + 0.5, bz + 0.5)) <= REACH) return;
-        moveToPosition(bx, by, bz, 2.5);
-        if (eyeDistance(Vector3d.from(bx + 0.5, by + 0.5, bz + 0.5)) > REACH) {
-            throw new IllegalStateException("Couldn't get within reach of (" + bx + ", " + by + ", " + bz + ")");
+    /** thrown when no standing position within reach of a block was found */
+    static class OutOfReachException extends IllegalStateException {
+        OutOfReachException(String message) { super(message); }
+    }
+
+    /** thrown when the server teleported the bot back during a movement */
+    static class MovementCorrectedException extends IllegalStateException {
+        MovementCorrectedException(String message) { super(message); }
+    }
+
+    /** thrown when a needed item is not in the inventory */
+    static class MissingItemException extends IllegalStateException {
+        final String item;
+        MissingItemException(String item) {
+            super("No " + item + " in inventory");
+            this.item = item;
         }
+    }
+
+    static String format(Vector3i p) {
+        return "(" + p.getX() + ", " + p.getY() + ", " + p.getZ() + ")";
+    }
+
+    private static Vector3d center(Vector3i p) {
+        return Vector3d.from(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5);
+    }
+
+    private boolean inReach(Vector3i p) {
+        return eyeDistance(center(p)) <= REACH;
+    }
+
+    /** @return true if the bot standing at the node would intersect the block cell */
+    private static boolean nodeIntersects(Node n, double standY, Vector3i p) {
+        return p.getX() == n.x && p.getZ() == n.z && p.getY() + 1 > standY && p.getY() < standY + HEIGHT;
+    }
+
+    /** walks to a position where the block is within reach and not inside the bot */
+    private void approach(Vector3i p) throws Exception {
+        if (inReach(p) && !intersectsBody(p.getX(), p.getY(), p.getZ())) return;
+        Vector3d c = center(p);
+        double reach = REACH - 0.3;
+        List<Node> path = search(n -> {
+                    double sy = standY(n.x, n.y, n.z);
+                    return Vector3d.from(n.x + 0.5, sy + EYE_HEIGHT, n.z + 0.5).distance(c) <= reach && !nodeIntersects(n, sy, p);
+                },
+                n -> Math.max(0, Vector3d.from(n.x + 0.5, n.y + EYE_HEIGHT, n.z + 0.5).distance(c) - reach),
+                4000, false);
+        if (path == null) throw new OutOfReachException("Couldn't get within reach of " + format(p));
+        followPath(path);
     }
 
     /** @return true if the block cell intersects the player's bounding box */
     private boolean intersectsBody(int bx, int by, int bz) {
         return bx + 1 > x - HALF_WIDTH && bx < x + HALF_WIDTH && bz + 1 > z - HALF_WIDTH && bz < z + HALF_WIDTH &&
                 by + 1 > y && by < y + HEIGHT;
+    }
+
+    private boolean isSolid(Vector3i p) {
+        int state = world.getBlock(p.getX(), p.getY(), p.getZ());
+        return state != World.UNKNOWN && GameData.collisionHeight(state) > 0;
+    }
+
+    /** @return true if a neighbor block can be clicked to place a block at the position */
+    private boolean hasSupport(Vector3i p) {
+        for (Direction side : Direction.values()) {
+            if (isSolid(p.add(offset(side)))) return true;
+        }
+        return false;
+    }
+
+    /** equips the item to the main hand if it's not held yet */
+    private void ensureHolding(String item) throws Exception {
+        InventoryItem held = getHeldItem();
+        if (held != null && held.name().equals(item)) return;
+        InventoryItem found = getInventory().stream().filter(i -> i.name().equals(item)).findFirst().orElse(null);
+        if (found == null) throw new MissingItemException(item);
+        equipItem(item, "hand");
     }
 
     /**
@@ -951,48 +1075,105 @@ class MinecraftBot {
         ensureConnected();
         actionLock.lock();
         try {
-            int before = world.getBlock(bx, by, bz);
-            if (before == World.UNKNOWN) throw new IllegalStateException("Chunk at (" + bx + ", " + by + ", " + bz + ") is not loaded");
-            if (GameData.collisionHeight(before) > 0) throw new IllegalStateException("There's already a block (" + GameData.blockName(before) + ") at (" + bx + ", " + by + ", " + bz + ")");
-            InventoryItem held = getHeldItem();
-            if (held == null) throw new IllegalStateException("Nothing in hand, equip a block first");
-
-            // solid neighbors to click on, the requested side first
-            List<Direction> candidates = new ArrayList<>(List.of(Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST, Direction.UP));
-            candidates.remove(faceDirection);
-            candidates.add(0, faceDirection);
-            candidates.removeIf(side -> {
-                Vector3i against = Vector3i.from(bx, by, bz).add(offset(side));
-                int state = world.getBlock(against.getX(), against.getY(), against.getZ());
-                return state == World.UNKNOWN || GameData.collisionHeight(state) == 0;
-            });
-            if (candidates.isEmpty()) throw new IllegalStateException("No adjacent block to place against at (" + bx + ", " + by + ", " + bz + ")");
-
-            approach(bx, by, bz);
-            if (intersectsBody(bx, by, bz)) throw new IllegalStateException("The bot is standing at (" + bx + ", " + by + ", " + bz + ")");
-
-            for (Direction side : candidates) {
-                Vector3i against = Vector3i.from(bx, by, bz).add(offset(side));
-                Direction face = opposite(side);
-                Vector3d hit = against.toDouble().add(0.5, 0.5, 0.5).add(offset(face).toDouble().mul(0.5));
-                if (eyeDistance(hit) > REACH + 0.5) continue;
-                lookAt(hit, true);
-                // sneak so that clicking on chests, doors etc. places instead of using them
-                send(new ServerboundPlayerInputPacket(false, false, false, false, false, true, false));
-                send(new ServerboundUseItemOnPacket(against, face, Hand.MAIN_HAND,
-                        (float) (hit.getX() - against.getX()), (float) (hit.getY() - against.getY()), (float) (hit.getZ() - against.getZ()),
-                        false, false, sequence.incrementAndGet()));
-                send(new ServerboundSwingPacket(Hand.MAIN_HAND));
-                send(new ServerboundPlayerInputPacket(false, false, false, false, false, false, false));
-                if (waitFor(() -> world.getBlock(bx, by, bz) != before, 2000)) {
-                    int after = world.getBlock(bx, by, bz);
-                    return new Block(GameData.blockName(after), after, Vector3i.from(bx, by, bz));
-                }
-                throw new IllegalStateException("The server didn't accept placing " + held.name() + " at (" + bx + ", " + by + ", " + bz + ")");
-            }
-            throw new IllegalStateException("Blocks to place against are out of reach at (" + bx + ", " + by + ", " + bz + ")");
+            return placeAt(Vector3i.from(bx, by, bz), faceDirection, true);
         } finally {
             actionLock.unlock();
+        }
+    }
+
+    /** @param allowMove walk within reach if needed, otherwise {@link OutOfReachException} */
+    private Block placeAt(Vector3i p, Direction faceDirection, boolean allowMove) throws Exception {
+        int bx = p.getX(), by = p.getY(), bz = p.getZ();
+        int before = world.getBlock(bx, by, bz);
+        if (before == World.UNKNOWN) throw new IllegalStateException("Chunk at " + format(p) + " is not loaded");
+        if (breakable(bx, by, bz)) { // leaves in the way
+            digAt(p, allowMove);
+            before = world.getBlock(bx, by, bz);
+        }
+        if (GameData.collisionHeight(before) > 0) throw new IllegalStateException("There's already a block (" + GameData.blockName(before) + ") at " + format(p));
+        InventoryItem held = getHeldItem();
+        if (held == null) throw new IllegalStateException("Nothing in hand, equip a block first");
+
+        // solid neighbors to click on, the requested side first
+        List<Direction> candidates = new ArrayList<>(List.of(Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST, Direction.UP));
+        candidates.remove(faceDirection);
+        candidates.addFirst(faceDirection);
+        candidates.removeIf(side -> !isSolid(p.add(offset(side))));
+        if (candidates.isEmpty()) throw new IllegalStateException("No adjacent block to place against at " + format(p));
+
+        if (allowMove) {
+            approach(p);
+        } else if (!inReach(p)) {
+            throw new OutOfReachException(format(p) + " is out of reach");
+        }
+        if (intersectsBody(bx, by, bz)) throw new IllegalStateException("The bot is standing at " + format(p));
+
+        for (int attempt = 0; ; attempt++) {
+            int current = world.getBlock(bx, by, bz);
+            Boolean placed = clickToPlace(p, candidates, current);
+            if (placed == null) throw new OutOfReachException("Blocks to place against are out of reach at " + format(p));
+            if (placed) {
+                int after = world.getBlock(bx, by, bz);
+                return new Block(GameData.blockName(after), after, p);
+            }
+            // plants etc. that are not replaceable by placing: remove and retry
+            if (attempt == 0 && !GameData.isAir(current) && !GameData.isFluid(current)) {
+                digAt(p, false);
+                continue;
+            }
+            throw new IllegalStateException("The server didn't accept placing " + held.name() + " at " + format(p));
+        }
+    }
+
+    /** @return true: placed, false: rejected by the server, null: no candidate in reach */
+    private Boolean clickToPlace(Vector3i p, List<Direction> candidates, int before) throws InterruptedException {
+        for (Direction side : candidates) {
+            Vector3i against = p.add(offset(side));
+            Direction face = opposite(side);
+            Vector3d hit = center(against).add(offset(face).toDouble().mul(0.5));
+            if (eyeDistance(hit) > REACH + 0.5) continue;
+            lookAt(hit, true);
+            // sneak so that clicking on chests, doors etc. places instead of using them
+            send(new ServerboundPlayerInputPacket(false, false, false, false, false, true, false));
+            send(new ServerboundUseItemOnPacket(against, face, Hand.MAIN_HAND,
+                    (float) (hit.getX() - against.getX()), (float) (hit.getY() - against.getY()), (float) (hit.getZ() - against.getZ()),
+                    false, false, sequence.incrementAndGet()));
+            send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+            send(new ServerboundPlayerInputPacket(false, false, false, false, false, false, false));
+            return waitFor(() -> world.getBlock(p.getX(), p.getY(), p.getZ()) != before, 2000);
+        }
+        return null;
+    }
+
+    private static final List<String> TOOL_MATERIALS = List.of("netherite", "diamond", "iron", "stone", "golden", "wooden");
+
+    /** @return the tool suffix (e.g. "_pickaxe") that digs the block fastest, null if none helps */
+    private static String toolFor(String block) {
+        if (block.endsWith("_leaves")) return "_hoe";
+        if (block.matches(".*(_log|_wood|_stem|_hyphae|_planks|mushroom_block|bookshelf|crafting_table|chest|barrel)$")
+                || block.matches("(oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak|bamboo|crimson|warped)_.*")) return "_axe";
+        if (block.matches(".*(stone|brick|bricks|cobble.*|_ore|deepslate|andesite|diorite|granite|terracotta|concrete|tuff|calcite|basalt|blackstone|obsidian|netherrack|sandstone|prismarine|purpur|quartz.*|ice)$")) return "_pickaxe";
+        if (block.matches("(dirt|coarse_dirt|rooted_dirt|grass_block|podzol|mycelium|farmland|dirt_path|sand|red_sand|gravel|clay|mud|muddy_mangrove_roots|snow|snow_block|soul_sand|soul_soil|powder_snow)")) return "_shovel";
+        return null;
+    }
+
+    /** holds the best tool in the inventory for the block, if any */
+    private void equipBestTool(String block) {
+        String suffix = toolFor(block);
+        if (suffix == null) return;
+        InventoryItem best = getInventory().stream()
+                .filter(i -> i.name().endsWith(suffix) && !(suffix.equals("_axe") && i.name().endsWith("_pickaxe")))
+                .min(Comparator.comparingInt(i -> {
+                    int rank = TOOL_MATERIALS.indexOf(i.name().substring(0, i.name().length() - suffix.length()));
+                    return rank < 0 ? TOOL_MATERIALS.size() : rank;
+                }))
+                .orElse(null);
+        InventoryItem held = getHeldItem();
+        if (best == null || held != null && held.name().equals(best.name())) return;
+        try {
+            equipItem(best.name(), "hand");
+        } catch (Exception e) {
+            logger.log(Level.DEBUG, "couldn't equip " + best.name() + ": " + e);
         }
     }
 
@@ -1009,36 +1190,442 @@ class MinecraftBot {
         ensureConnected();
         actionLock.lock();
         try {
-            int state = world.getBlock(bx, by, bz);
-            if (state == World.UNKNOWN) throw new IllegalStateException("Chunk at (" + bx + ", " + by + ", " + bz + ") is not loaded");
-            Block block = new Block(GameData.blockName(state), state, Vector3i.from(bx, by, bz));
-            if (GameData.isAir(state)) throw new IllegalStateException("No block found at position (" + bx + ", " + by + ", " + bz + ")");
-            if (gameMode != GameMode.CREATIVE && UNBREAKABLE.contains(block.name())) throw new IllegalStateException(block.name() + " can't be dug");
-
-            approach(bx, by, bz);
-            Vector3i pos = Vector3i.from(bx, by, bz);
-            Direction face = faceToward(bx, by, bz);
-            lookAt(Vector3d.from(bx + 0.5, by + 0.5, bz + 0.5), true);
-            send(new ServerboundPlayerActionPacket(PlayerAction.START_DIGGING, pos, face, sequence.incrementAndGet()));
-            send(new ServerboundSwingPacket(Hand.MAIN_HAND));
-            if (gameMode != GameMode.CREATIVE) {
-                // the server finishes the block by itself when breaking time has passed (delayed destroy)
-                Thread.sleep(TICK_MS);
-                send(new ServerboundPlayerActionPacket(PlayerAction.FINISH_DIGGING, pos, face, sequence.incrementAndGet()));
-            }
-            long until = System.currentTimeMillis() + 60_000;
-            for (int i = 0; world.getBlock(bx, by, bz) == state; i++) {
-                if (System.currentTimeMillis() > until) {
-                    send(new ServerboundPlayerActionPacket(PlayerAction.CANCEL_DIGGING, pos, face, sequence.incrementAndGet()));
-                    throw new IllegalStateException("Timed out digging " + block.name());
-                }
-                if (i % 5 == 4) send(new ServerboundSwingPacket(Hand.MAIN_HAND));
-                Thread.sleep(TICK_MS);
-            }
-            return block;
+            return digAt(Vector3i.from(bx, by, bz), true);
         } finally {
             actionLock.unlock();
         }
+    }
+
+    /** @param allowMove walk within reach if needed, otherwise {@link OutOfReachException} */
+    private Block digAt(Vector3i pos, boolean allowMove) throws Exception {
+        int bx = pos.getX(), by = pos.getY(), bz = pos.getZ();
+        int state = world.getBlock(bx, by, bz);
+        if (state == World.UNKNOWN) throw new IllegalStateException("Chunk at " + format(pos) + " is not loaded");
+        Block block = new Block(GameData.blockName(state), state, pos);
+        if (GameData.isAir(state)) throw new IllegalStateException("No block found at position " + format(pos));
+        if (gameMode != GameMode.CREATIVE && UNBREAKABLE.contains(block.name())) throw new IllegalStateException(block.name() + " can't be dug");
+
+        if (allowMove) {
+            if (!inReach(pos)) approach(pos);
+        } else if (!inReach(pos)) {
+            throw new OutOfReachException(format(pos) + " is out of reach");
+        }
+        equipBestTool(block.name());
+        Direction face = faceToward(bx, by, bz);
+        lookAt(center(pos), true);
+        send(new ServerboundPlayerActionPacket(PlayerAction.START_DIGGING, pos, face, sequence.incrementAndGet()));
+        send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+        if (gameMode != GameMode.CREATIVE) {
+            // the server finishes the block by itself when breaking time has passed (delayed destroy)
+            Thread.sleep(TICK_MS);
+            send(new ServerboundPlayerActionPacket(PlayerAction.FINISH_DIGGING, pos, face, sequence.incrementAndGet()));
+        }
+        long until = System.currentTimeMillis() + 60_000;
+        for (int i = 0; world.getBlock(bx, by, bz) == state; i++) {
+            if (System.currentTimeMillis() > until) {
+                send(new ServerboundPlayerActionPacket(PlayerAction.CANCEL_DIGGING, pos, face, sequence.incrementAndGet()));
+                throw new IllegalStateException("Timed out digging " + block.name());
+            }
+            if (i % 5 == 4) send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+            Thread.sleep(TICK_MS);
+        }
+        return block;
+    }
+
+    // ----------------------------------------------------------------------------------------------------------------
+    // scaffolding
+
+    /**
+     * builds a pillar under itself by jumping and placing blocks below.
+     * @return placed positions, bottom first
+     */
+    private List<Vector3i> pillarUp(int height, String item) throws Exception {
+        List<Vector3i> placed = new ArrayList<>();
+        int teleportsBefore = teleports.get();
+        int cx = (int) Math.floor(x), cz = (int) Math.floor(z);
+        walkTo(cx + 0.5, cz + 0.5, teleportsBefore);
+        GameData.BlockInfo info = GameData.block(item);
+        int predicted = info != null ? info.defaultStateId() : 1;
+        for (int i = 0; i < height; i++) {
+            int by = (int) Math.floor(y + EPSILON);
+            if (breakable(cx, by + 2, cz)) digAt(Vector3i.from(cx, by + 2, cz), false);
+            if (!passable(cx, by + 2, cz)) break; // no head room
+            ensureHolding(item);
+            teleportsBefore = teleports.get();
+            Vector3i against = Vector3i.from(cx, by - 1, cz);
+            lookAt(Vector3d.from(cx + 0.5, by, cz + 0.5), true);
+            velocityY = JUMP_VELOCITY;
+            onGround = false;
+            while (y < by + 1 + EPSILON) {
+                y += velocityY;
+                velocityY = (velocityY - GRAVITY) * DRAG;
+                tick(teleportsBefore);
+            }
+            send(new ServerboundUseItemOnPacket(against, Direction.UP, Hand.MAIN_HAND, 0.5f, 1f, 0.5f, false, false, sequence.incrementAndGet()));
+            send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+            world.setBlock(cx, by, cz, predicted); // client side prediction, the server sends the real state
+            placed.add(Vector3i.from(cx, by, cz));
+            fallToGround(teleportsBefore);
+            if (!isSolid(Vector3i.from(cx, by, cz))) throw new IllegalStateException("The server didn't accept the scaffold block at " + format(Vector3i.from(cx, by, cz)));
+        }
+        return placed;
+    }
+
+    /** digs the pillar under itself from the top */
+    private void pillarDown(List<Vector3i> pillar) throws Exception {
+        for (Vector3i p : pillar.reversed()) {
+            if (!isSolid(p)) continue;
+            digAt(p, true);
+            fallToGround(teleports.get());
+        }
+    }
+
+    @FunctionalInterface
+    interface Work {
+        void run() throws Exception;
+    }
+
+    /**
+     * stands on a temporary pillar near the target, runs the work there and removes the pillar.
+     * @param avoid positions the pillar and the bot must not occupy
+     * @return false if no place for a pillar was found
+     */
+    private boolean withScaffold(Vector3i target, Set<Vector3i> avoid, String item, Work work) throws Exception {
+        record Candidate(Node base, int height, double score) {}
+        List<Candidate> candidates = new ArrayList<>();
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                if (dx == 0 && dz == 0) continue;
+                double horizontal = Math.sqrt(dx * dx + dz * dz);
+                if (horizontal > REACH - 0.8) continue;
+                int cx = target.getX() + dx, cz = target.getZ() + dz;
+                for (int gy = target.getY(); gy >= target.getY() - 16; gy--) {
+                    if (standCost(cx, gy, cz) < 0) continue;
+                    int height = Math.max(0, target.getY() - gy - 1); // eye a bit above the target
+                    boolean free = true;
+                    for (int cy = gy; cy <= gy + height + 1 && free; cy++) {
+                        free = clearCost(cx, cy, cz) >= 0 && !avoid.contains(Vector3i.from(cx, cy, cz)); // leaves are dug
+                    }
+                    if (free) candidates.add(new Candidate(new Node(cx, gy, cz), height, height * 2 + horizontal));
+                }
+            }
+        }
+        logger.log(Level.DEBUG, candidates.size() + " scaffold candidates for " + format(target));
+        if (candidates.isEmpty()) return false;
+        // one search to the nearest reachable base, the extra cost of a taller pillar works as a goal penalty
+        Map<Node, Candidate> bases = new HashMap<>();
+        candidates.forEach(c -> bases.merge(c.base(), c, (a, b) -> a.score() <= b.score() ? a : b));
+        List<Node> path = search(bases::containsKey, n -> 0, 30000, false);
+        if (path == null) {
+            logger.log(Level.DEBUG, "no path to any scaffold base for " + format(target));
+            return false;
+        }
+        Candidate c = bases.get(path.isEmpty() ? currentNode() : path.getLast());
+        followPath(path);
+        logger.log(Level.DEBUG, "scaffold " + c.height() + " blocks at " + c.base() + " for " + format(target));
+        List<Vector3i> pillar = pillarUp(c.height(), item);
+        try {
+            work.run();
+        } finally {
+            pillarDown(pillar);
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------------------------------------------------------
+    // batch operations
+
+    /** a block to place, {@code block} is an item name */
+    record Placement(Vector3i position, String block) {}
+
+    /**
+     * @param done placed or dug
+     * @param alreadyDone already in the desired state at the start
+     * @param remaining left undone
+     * @param missingItems item name to count which were not in the inventory
+     */
+    record BatchResult(int done, int alreadyDone, int remaining, Map<String, Integer> missingItems, List<String> problems, boolean timedOut) {}
+
+    /** wall variants of items, e.g. torch is placed as wall_torch against a wall */
+    private static boolean matches(int state, String item) {
+        String name = GameData.blockName(state);
+        return name.equals(item) || name.equals(item.replaceFirst("(torch|sign|banner|head|skull|fan)$", "wall_$1"));
+    }
+
+    private Comparator<Vector3i> nearest() {
+        Vector3d eye = Vector3d.from(x, y + EYE_HEIGHT, z);
+        return Comparator.comparingDouble(p -> center(p).distance(eye));
+    }
+
+    /**
+     * places many blocks: equips items, orders placements so that every block has a neighbor to place against,
+     * walks within reach and stands on temporary pillars of {@code scaffoldItem} for high positions.
+     */
+    public BatchResult buildBlocks(List<Placement> placements, String scaffoldItem, long maxMillis) throws Exception {
+        ensureConnected();
+        actionLock.lock();
+        try {
+            long deadline = System.currentTimeMillis() + maxMillis;
+            Map<Vector3i, String> pending = new LinkedHashMap<>();
+            List<String> problems = new ArrayList<>();
+            Set<String> missing = new HashSet<>();
+            int alreadyDone = 0;
+            int[] done = {0};
+            for (Placement p : placements) {
+                String item = GameData.stripNamespace(p.block());
+                if (GameData.itemId(item) < 0) {
+                    problems.add("Unknown item " + item + " at " + format(p.position()));
+                } else if (matches(world.getBlock(p.position().getX(), p.position().getY(), p.position().getZ()), item)) {
+                    alreadyDone++;
+                } else {
+                    pending.put(p.position(), item);
+                }
+            }
+
+            boolean timedOut = false;
+            while (!pending.isEmpty()) {
+                if (System.currentTimeMillis() > deadline) {
+                    timedOut = true;
+                    break;
+                }
+                List<Vector3i> unreachable = new ArrayList<>();
+                int placed = placePass(pending, true, deadline, problems, missing, unreachable);
+                done[0] += placed;
+                if (placed > 0) continue;
+                if (unreachable.isEmpty()) break;
+
+                Vector3i target = unreachable.stream().min(Comparator.comparingInt(Vector3i::getY).thenComparing(nearest())).orElseThrow();
+                int before = done[0];
+                boolean scaffolded = withScaffold(target, pending.keySet(), scaffoldItem, () -> {
+                    int n;
+                    do {
+                        n = placePass(pending, false, deadline, problems, missing, new ArrayList<>());
+                        done[0] += n;
+                    } while (n > 0);
+                });
+                if (!scaffolded || done[0] == before) {
+                    problems.add("Couldn't reach " + format(target) + (scaffolded ? "" : ", no place for a scaffold"));
+                    pending.remove(target);
+                }
+            }
+
+            Map<String, Integer> missingItems = new TreeMap<>();
+            for (Map.Entry<Vector3i, String> e : pending.entrySet()) {
+                if (missing.contains(e.getValue())) {
+                    missingItems.merge(e.getValue(), 1, Integer::sum);
+                } else if (!timedOut) {
+                    problems.add("No block to place against at " + format(e.getKey()));
+                }
+            }
+            return new BatchResult(done[0], alreadyDone, pending.size(), missingItems, problems, timedOut);
+        } finally {
+            actionLock.unlock();
+        }
+    }
+
+    private static boolean isDoor(String item) {
+        return item.endsWith("_door") || item.endsWith("_fence_gate") || item.endsWith("_trapdoor");
+    }
+
+    /** @return number of placed blocks */
+    private int placePass(Map<Vector3i, String> pending, boolean allowMove, long deadline,
+                          List<String> problems, Set<String> missing, List<Vector3i> unreachable) throws Exception {
+        int placed = 0;
+        List<Vector3i> order = new ArrayList<>(pending.keySet());
+        order.sort(Comparator.comparingInt(Vector3i::getY).thenComparing(nearest()));
+        // doors and gates last, so that the bot doesn't shut itself in
+        boolean onlyDoors = pending.values().stream().allMatch(item -> isDoor(item) || missing.contains(item));
+        for (Vector3i p : order) {
+            if (System.currentTimeMillis() > deadline) break;
+            String item = pending.get(p);
+            if (item == null || missing.contains(item) || isDoor(item) && !onlyDoors) continue;
+            int state = world.getBlock(p.getX(), p.getY(), p.getZ());
+            if (state == World.UNKNOWN) {
+                problems.add("Chunk at " + format(p) + " is not loaded");
+                pending.remove(p);
+            } else if (matches(state, item)) {
+                pending.remove(p);
+            } else if (GameData.collisionHeight(state) > 0 && !breakable(p.getX(), p.getY(), p.getZ())) {
+                problems.add("Occupied by " + GameData.blockName(state) + " at " + format(p));
+                pending.remove(p);
+            } else if (hasSupport(p) && (allowMove || inReach(p) && !intersectsBody(p.getX(), p.getY(), p.getZ()))) {
+                try {
+                    ensureHolding(item);
+                    placeAt(p, Direction.DOWN, allowMove);
+                    placed++;
+                    pending.remove(p);
+                } catch (MissingItemException e) {
+                    missing.add(e.item);
+                } catch (OutOfReachException e) {
+                    unreachable.add(p);
+                } catch (MovementCorrectedException e) {
+                    logger.log(Level.DEBUG, e.getMessage());
+                } catch (IllegalStateException e) {
+                    problems.add(e.getMessage());
+                    pending.remove(p);
+                }
+            }
+        }
+        return placed;
+    }
+
+    /**
+     * digs every block in the box (both corners inclusive) from the top, using pillars of {@code scaffoldItem} for high blocks.
+     * @param only dig only blocks whose names contain one of these, empty for all
+     */
+    public BatchResult clearRegion(Vector3i from, Vector3i to, List<String> only, String scaffoldItem, long maxMillis) throws Exception {
+        ensureConnected();
+        actionLock.lock();
+        try {
+            long deadline = System.currentTimeMillis() + maxMillis;
+            Vector3i min = from.min(to), max = from.max(to);
+            Set<Vector3i> pending = new LinkedHashSet<>();
+            List<String> problems = new ArrayList<>();
+            int alreadyDone = 0;
+            for (int bx = min.getX(); bx <= max.getX(); bx++) {
+                for (int by = min.getY(); by <= max.getY(); by++) {
+                    for (int bz = min.getZ(); bz <= max.getZ(); bz++) {
+                        int state = world.getBlock(bx, by, bz);
+                        if (state == World.UNKNOWN) {
+                            problems.add("Chunk at " + format(Vector3i.from(bx, by, bz)) + " is not loaded");
+                        } else if (GameData.isAir(state) || GameData.isFluid(state)) {
+                            alreadyDone++;
+                        } else if (!only.isEmpty() && only.stream().noneMatch(GameData.blockName(state)::contains)) {
+                            continue;
+                        } else if (gameMode != GameMode.CREATIVE && UNBREAKABLE.contains(GameData.blockName(state))) {
+                            problems.add(GameData.blockName(state) + " can't be dug at " + format(Vector3i.from(bx, by, bz)));
+                        } else {
+                            pending.add(Vector3i.from(bx, by, bz));
+                        }
+                    }
+                }
+            }
+
+            int[] done = {0};
+            boolean timedOut = false;
+            while (!pending.isEmpty()) {
+                if (System.currentTimeMillis() > deadline) {
+                    timedOut = true;
+                    break;
+                }
+                List<Vector3i> unreachable = new ArrayList<>();
+                int dug = digPass(pending, true, deadline, problems, unreachable);
+                done[0] += dug;
+                if (dug > 0) continue;
+                if (unreachable.isEmpty()) break;
+
+                Vector3i target = unreachable.stream().min(nearest()).orElseThrow();
+                int before = done[0];
+                boolean scaffolded = withScaffold(target, Set.of(), scaffoldItem, () -> {
+                    int n;
+                    do {
+                        n = digPass(pending, false, deadline, problems, new ArrayList<>());
+                        done[0] += n;
+                    } while (n > 0);
+                });
+                if (!scaffolded || done[0] == before) {
+                    problems.add("Couldn't reach " + format(target) + (scaffolded ? "" : ", no place for a scaffold"));
+                    pending.remove(target);
+                }
+            }
+            if (!timedOut) pending.forEach(p -> problems.add("Couldn't dig " + GameData.blockName(world.getBlock(p.getX(), p.getY(), p.getZ())) + " at " + format(p)));
+            return new BatchResult(done[0], alreadyDone, pending.size(), Map.of(), problems, timedOut);
+        } finally {
+            actionLock.unlock();
+        }
+    }
+
+    /** @return number of dug blocks */
+    private int digPass(Set<Vector3i> pending, boolean allowMove, long deadline, List<String> problems, List<Vector3i> unreachable) throws Exception {
+        int dug = 0;
+        List<Vector3i> order = new ArrayList<>(pending);
+        order.sort(Comparator.comparingInt(Vector3i::getY).reversed().thenComparing(nearest()));
+        for (Vector3i p : order) {
+            if (System.currentTimeMillis() > deadline) break;
+            int state = world.getBlock(p.getX(), p.getY(), p.getZ());
+            if (GameData.isAir(state) || GameData.isFluid(state)) { // e.g. leaves decayed
+                pending.remove(p);
+                continue;
+            }
+            // don't dig the floor under the bot, it'd fall into the region
+            if (p.getX() == (int) Math.floor(x) && p.getZ() == (int) Math.floor(z) && p.getY() < y) continue;
+            if (!allowMove && !inReach(p)) continue;
+            try {
+                digAt(p, allowMove);
+                fallToGround(teleports.get());
+                dug++;
+                pending.remove(p);
+            } catch (OutOfReachException e) {
+                unreachable.add(p);
+            } catch (MovementCorrectedException e) {
+                logger.log(Level.DEBUG, e.getMessage());
+            } catch (IllegalStateException e) {
+                problems.add(e.getMessage());
+                pending.remove(p);
+            }
+        }
+        return dug;
+    }
+
+    /** logs, leaves and other parts of trees */
+    private static boolean isTree(int state) {
+        String name = GameData.blockName(state);
+        return name.endsWith("_log") || name.endsWith("_leaves") || name.endsWith("_wood") || name.endsWith("mushroom_block")
+                || name.equals("mushroom_stem") || name.equals("vine") || name.equals("bee_nest") || name.equals("cocoa");
+    }
+
+    /**
+     * a height map of the area around the bot's height.
+     * @param ground ignore trees
+     * @return text with one row per z, each cell is the height of the top block relative to a base and its legend letter
+     */
+    public String scanArea(int x1, int z1, int x2, int z2, boolean ground) throws Exception {
+        ensureConnected();
+        int minX = Math.min(x1, x2), maxX = Math.max(x1, x2), minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
+        if (maxX - minX > 63 || maxZ - minZ > 63) throw new IllegalArgumentException("Area must be at most 64x64");
+        int top = Math.min(world.maxY(), (int) y + 32), bottom = Math.max(world.minY(), (int) y - 32);
+        int[][] heights = new int[maxZ - minZ + 1][maxX - minX + 1];
+        String[][] names = new String[maxZ - minZ + 1][maxX - minX + 1];
+        int base = Integer.MAX_VALUE;
+        for (int bz = minZ; bz <= maxZ; bz++) {
+            for (int bx = minX; bx <= maxX; bx++) {
+                heights[bz - minZ][bx - minX] = Integer.MIN_VALUE;
+                if (!world.isLoaded(bx, bz)) continue;
+                for (int by = top; by >= bottom; by--) {
+                    int state = world.getBlock(bx, by, bz);
+                    if ((GameData.collisionHeight(state) > 0 || GameData.isFluid(state)) && !(ground && isTree(state))) {
+                        heights[bz - minZ][bx - minX] = by;
+                        names[bz - minZ][bx - minX] = GameData.blockName(state);
+                        base = Math.min(base, by);
+                        break;
+                    }
+                }
+            }
+        }
+        Map<String, Character> legend = new LinkedHashMap<>();
+        String letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        StringBuilder sb = new StringBuilder();
+        sb.append("Height map: each cell is (top block y - ").append(base).append(") + block letter, '??' not loaded, '--' nothing within ")
+                .append(bottom).append("..").append(top).append("\n");
+        sb.append("x:     ");
+        for (int bx = minX; bx <= maxX; bx++) sb.append(String.format("%4d", Math.floorMod(bx, 1000)));
+        sb.append('\n');
+        for (int bz = minZ; bz <= maxZ; bz++) {
+            sb.append(String.format("z=%-5d", bz));
+            for (int bx = minX; bx <= maxX; bx++) {
+                int h = heights[bz - minZ][bx - minX];
+                String name = names[bz - minZ][bx - minX];
+                if (!world.isLoaded(bx, bz)) sb.append("  ??");
+                else if (h == Integer.MIN_VALUE) sb.append("  --");
+                else {
+                    char c = legend.computeIfAbsent(name, k -> legend.size() < letters.length() ? letters.charAt(legend.size()) : '?');
+                    sb.append(String.format("%3d%c", h - base, c));
+                }
+            }
+            sb.append('\n');
+        }
+        sb.append("legend: ").append(legend.entrySet().stream().map(e -> e.getValue() + "=" + e.getKey()).collect(Collectors.joining(", ")));
+        return sb.toString();
     }
 
     /** @return null if the chunk is not loaded */
